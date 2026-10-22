@@ -1,7 +1,7 @@
 //! 5-wave chaos traffic generator and auditor, fired at the candidate router
 //! on 127.0.0.1:8080.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,14 +14,16 @@ use serde_json::json;
 use tokio::sync::Barrier;
 
 use crate::types::{AdminStateResponse, RouterChatRequest, StreamChunk};
-use crate::upstream::{UpstreamState, CANONICAL_TOKENS, DELAY_HEADER};
+use crate::upstream::{initial_users, UpstreamState, CANONICAL_TOKENS, DELAY_HEADER};
 
 pub const CHAT_URL: &str = "http://127.0.0.1:8080/v1/chat/completions";
 pub const ADMIN_URL: &str = "http://127.0.0.1:8080/admin/state";
 
 const PROMPT_SEED: &str =
     "Nexus routes every prompt across five upstream providers while keeping a strict ledger. ";
-const NEGATIVE_EPSILON_CENTS: f64 = -0.0001;
+pub const NEGATIVE_EPSILON_CENTS: f64 = -0.0001;
+/// Slack for comparing the router's propagated delay with our own clock.
+const DELAY_HEADER_TOLERANCE_MS: f64 = 1.0;
 
 /// Everything observed about a single request to the router.
 #[derive(Debug, Default, Clone)]
@@ -61,10 +63,17 @@ pub struct ChaosReport {
     pub internal_overhead_samples_ms: Vec<f64>,
     pub ttfb_samples_ms: Vec<f64>,
     pub corrupted_streams_count: usize,
+    /// Valid, affordable requests (waves 1 & 4) that did not return 2xx with
+    /// the full expected text.
+    pub incomplete_requests: usize,
+    /// Upstream spend on `user_low_balance` beyond its balance in wave 2.
+    pub wave2_overspend_cents: f64,
     pub total_requests: usize,
     pub transport_errors: usize,
     /// 2xx responses that did not propagate `X-Upstream-Simulated-Delay-Ms`.
     pub missing_delay_header: usize,
+    /// 2xx responses claiming more upstream delay than the request took.
+    pub inflated_delay_header: usize,
     pub wave4_streams: usize,
     pub wave4_complete: usize,
     pub wave4_drops_injected: u64,
@@ -72,21 +81,32 @@ pub struct ChaosReport {
 }
 
 impl ChaosReport {
-    fn record(&mut self, o: &Outcome) {
+    /// Latency is sampled only for 2xx replies; `sample_latency: false` skips
+    /// replies that may be served from an idempotency cache.
+    fn record(&mut self, o: &Outcome, sample_latency: bool) {
         self.total_requests += 1;
         if o.transport_error.is_some() {
             self.transport_errors += 1;
             return;
         }
-        if o.is_success() && o.upstream_delay_ms.is_none() {
-            self.missing_delay_header += 1;
+        if !o.is_success() || !sample_latency {
+            return;
         }
-        let upstream_ms = o.upstream_delay_ms.unwrap_or(0.0);
+        // A missing or impossible header counts the full latency as overhead.
+        let upstream_ms = match o.upstream_delay_ms {
+            None => {
+                self.missing_delay_header += 1;
+                0.0
+            }
+            Some(ms) if ms > o.elapsed_ms + DELAY_HEADER_TOLERANCE_MS => {
+                self.inflated_delay_header += 1;
+                0.0
+            }
+            Some(ms) => ms,
+        };
         self.internal_overhead_samples_ms
             .push((o.elapsed_ms - upstream_ms).max(0.05));
-        if o.is_success() {
-            self.ttfb_samples_ms.push(o.ttfb_ms);
-        }
+        self.ttfb_samples_ms.push(o.ttfb_ms);
     }
 }
 
@@ -103,9 +123,9 @@ pub fn percentile(samples: &[f64], p: f64) -> Option<f64> {
 
 pub async fn run(client: &Client, upstream: &UpstreamState) -> ChaosReport {
     let mut report = ChaosReport::default();
-    wave1_financial_precision(client, upstream, &mut report).await;
-    wave2_double_spend(client, &mut report).await;
-    wave3_idempotency_storm(client, upstream, &mut report).await;
+    let markup = wave1_financial_precision(client, upstream, &mut report).await;
+    wave2_double_spend(client, upstream, &mut report).await;
+    wave3_idempotency_storm(client, upstream, markup, &mut report).await;
     wave4_upstream_chaos(client, upstream, &mut report).await;
     wave5_malformed(client, upstream, &mut report).await;
     report
@@ -136,11 +156,12 @@ async fn balance_of(client: &Client, user_id: &str) -> Option<f64> {
 // Waves
 // ---------------------------------------------------------------------------
 
+/// Returns the router's billed / upstream-cost ratio, used to judge wave 3.
 async fn wave1_financial_precision(
     client: &Client,
     upstream: &UpstreamState,
     report: &mut ChaosReport,
-) {
+) -> Option<f64> {
     wave_header(
         1,
         "Sub-Cent Financial Precision & Sanity",
@@ -156,10 +177,12 @@ async fn wave1_financial_precision(
     let mut statuses = BTreeMap::new();
     let mut ok = 0;
     let mut valid_text = 0;
+    let mut expected = Vec::new();
     for batch in 0..10 {
         let bodies: Vec<String> = (0..4)
             .map(|j| {
                 let i = batch * 4 + j;
+                expected.push(canonical_text(MAX_TOKENS[i % 4]));
                 encode(&new_request(
                     "user_whale",
                     prompt_of_len(PROMPT_LENGTHS[i % 3], i * 7),
@@ -170,17 +193,18 @@ async fn wave1_financial_precision(
             })
             .collect();
         let outcomes = join_all(bodies.into_iter().map(|b| send(client, b))).await;
-        for o in &outcomes {
-            report.record(o);
+        for (o, want) in outcomes.iter().zip(&expected[batch * 4..]) {
+            report.record(o, true);
             *statuses.entry(o.status_label()).or_insert(0usize) += 1;
             if o.is_success() {
                 ok += 1;
-                if is_canonical_prefix(&o.text) && !o.text.is_empty() {
+                if o.text == *want {
                     valid_text += 1;
                 }
             }
         }
     }
+    report.incomplete_requests += 40 - valid_text;
 
     let balance_after = balance_of(client, "user_whale").await;
     let upstream_cost = upstream.metrics().total_upstream_cost_cents - cost_before;
@@ -189,7 +213,7 @@ async fn wave1_financial_precision(
     check(ok == 40, &format!("{ok}/40 requests returned 2xx"));
     check(
         valid_text == ok,
-        &format!("{valid_text}/{ok} successful bodies carry valid canonical text"),
+        &format!("{valid_text}/{ok} successful bodies carry the full expected text"),
     );
     match (balance_before, balance_after) {
         (Some(before), Some(after)) => {
@@ -201,36 +225,48 @@ async fn wave1_financial_precision(
                 billed + 1e-9 >= upstream_cost,
                 "user_whale was billed at least the upstream cost (no sub-cent rounding leak)",
             );
+            (upstream_cost > 0.0).then(|| billed / upstream_cost)
         }
-        _ => warn("could not read user_whale balance from /admin/state"),
+        _ => {
+            warn("could not read user_whale balance from /admin/state");
+            None
+        }
     }
 }
 
-async fn wave2_double_spend(client: &Client, report: &mut ChaosReport) {
+async fn wave2_double_spend(client: &Client, upstream: &UpstreamState, report: &mut ChaosReport) {
     wave_header(
         2,
         "The Double-Spend Burst",
-        "20 simultaneous requests for user_low_balance (0.05 cents), max_output_tokens=800",
+        "20 simultaneous requests for user_low_balance (0.05 cents), max_output_tokens=800, \
+         min_review_score=4.8 (claude-3-5-sonnet only, ~0.0168 cents per reply)",
     );
+    let initial_balance = initial_users()
+        .into_iter()
+        .find(|u| u.user_id == "user_low_balance")
+        .map_or(0.0, |u| u.balance_cents);
     let balance_before = balance_of(client, "user_low_balance").await;
+    let cost_before = upstream.metrics().total_upstream_cost_cents;
     let bodies = (0..20)
         .map(|i| {
             encode(&new_request(
                 "user_low_balance",
                 prompt_of_len(24, i * 3),
                 800,
-                4.1,
+                4.8,
                 false,
             ))
         })
         .collect();
     let outcomes = fire_simultaneously(client, bodies).await;
+    let spent = upstream.metrics().total_upstream_cost_cents - cost_before;
+    report.wave2_overspend_cents = (spent - initial_balance).max(0.0);
 
     let mut accepted = 0;
     let mut payment_required = 0;
     let mut other = BTreeMap::new();
     for o in &outcomes {
-        report.record(o);
+        report.record(o, true);
         match o.status {
             Some(s) if (200..300).contains(&s) => accepted += 1,
             Some(402) => payment_required += 1,
@@ -261,11 +297,19 @@ async fn wave2_double_spend(client: &Client, report: &mut ChaosReport) {
         }
         None => warn("could not read user_low_balance from /admin/state"),
     }
+    info(&format!(
+        "upstream spend serving user_low_balance: {spent:.6} cents"
+    ));
+    check(
+        report.wave2_overspend_cents == 0.0,
+        &format!("upstream spend stayed within the {initial_balance} cent balance"),
+    );
 }
 
 async fn wave3_idempotency_storm(
     client: &Client,
     upstream: &UpstreamState,
+    markup: Option<f64>,
     report: &mut ChaosReport,
 ) {
     wave_header(
@@ -285,13 +329,9 @@ async fn wave3_idempotency_storm(
     let balance_after = balance_of(client, "user_standard").await;
 
     let mut statuses = BTreeMap::new();
-    let mut bodies = BTreeSet::new();
     for o in &outcomes {
-        report.record(o);
+        report.record(o, false);
         *statuses.entry(o.status_label()).or_insert(0usize) += 1;
-        if o.is_success() {
-            bodies.insert(o.text.clone());
-        }
     }
     let successes = |m: &crate::types::UpstreamMetrics| m.total_requests - m.total_failures;
     let generations = successes(&metrics_after).saturating_sub(successes(&metrics_before));
@@ -305,22 +345,29 @@ async fn wave3_idempotency_storm(
         "storm collapsed into at most one billable upstream generation",
     );
     check(
-        bodies.len() <= 1,
-        "every successful reply carries the same content",
+        outcomes.iter().any(Outcome::is_success),
+        "at least one reply succeeded",
     );
+    let cost = metrics_after.total_upstream_cost_cents - metrics_before.total_upstream_cost_cents;
     match (balance_before, balance_after) {
         (Some(before), Some(after)) => {
-            info(&format!("user_standard debited {:.6} cents", before - after))
+            let debited = before - after;
+            info(&format!(
+                "user_standard debited {debited:.6} cents | upstream cost incurred {cost:.6} cents"
+            ));
+            // Allowance: one generation at the markup observed in wave 1, x2.
+            let one_generation = cost / generations.max(1) as f64;
+            let allowance = 2.0 * markup.unwrap_or(1.0).max(1.0) * one_generation;
+            check(
+                debited <= allowance + 1e-9,
+                "user_standard was charged for one generation, not once per duplicate",
+            );
         }
         _ => warn("could not read user_standard balance from /admin/state"),
     }
 }
 
-async fn wave4_upstream_chaos(
-    client: &Client,
-    upstream: &UpstreamState,
-    report: &mut ChaosReport,
-) {
+async fn wave4_upstream_chaos(client: &Client, upstream: &UpstreamState, report: &mut ChaosReport) {
     wave_header(
         4,
         "Upstream Chaos, Mid-Stream Drops & Latency Spikes",
@@ -353,7 +400,7 @@ async fn wave4_upstream_chaos(
     let mut models = BTreeMap::new();
     let mut first_corrupted: Option<String> = None;
     for o in &outcomes {
-        report.record(o);
+        report.record(o, true);
         if !o.is_success() {
             *failed.entry(o.status_label()).or_insert(0usize) += 1;
             continue;
@@ -376,6 +423,7 @@ async fn wave4_upstream_chaos(
     }
 
     report.corrupted_streams_count += corrupted;
+    report.incomplete_requests += outcomes.len() - complete;
     report.wave4_streams = outcomes.len();
     report.wave4_complete = complete;
     report.wave4_drops_injected = metrics_after.mid_stream_drops - metrics_before.mid_stream_drops;
@@ -395,7 +443,10 @@ async fn wave4_upstream_chaos(
         report.wave4_drops_injected, report.wave4_handover_resumes
     ));
     if !models.is_empty() {
-        info(&format!("final model per stream: {}", format_tally(&models)));
+        info(&format!(
+            "final model per stream: {}",
+            format_tally(&models)
+        ));
     }
     if surfaced_errors > 0 {
         info(&format!(
@@ -403,13 +454,18 @@ async fn wave4_upstream_chaos(
         ));
     }
     if malformed_frames > 0 {
-        warn(&format!("{malformed_frames} SSE frames were not valid StreamChunk JSON"));
+        warn(&format!(
+            "{malformed_frames} SSE frames were not valid StreamChunk JSON"
+        ));
     }
     if let Some(text) = first_corrupted {
         warn(&format!("example corrupted stream: {text:?}"));
     }
     check(corrupted == 0, "no duplicated / corrupted streams");
-    check(complete == outcomes.len(), "every stream delivered the full sentence");
+    check(
+        complete == outcomes.len(),
+        "every stream delivered the full sentence",
+    );
 }
 
 async fn wave5_malformed(client: &Client, upstream: &UpstreamState, report: &mut ChaosReport) {
@@ -421,7 +477,8 @@ async fn wave5_malformed(client: &Client, upstream: &UpstreamState, report: &mut
     let balance_before = balance_of(client, "user_standard").await;
     let requests_before = upstream.metrics().total_requests;
 
-    let cases: Vec<(&str, String)> = vec![
+    let cases: Vec<(&str, String)> =
+        vec![
         ("max_output_tokens = -50", mutated(|v| v["max_output_tokens"] = json!(-50))),
         (
             "max_output_tokens = -50 (stream)",
@@ -457,7 +514,7 @@ async fn wave5_malformed(client: &Client, upstream: &UpstreamState, report: &mut
     let total = cases.len();
     for (name, body) in cases {
         let o = send(client, body).await;
-        report.record(&o);
+        report.record(&o, true);
         let pass = o.is_client_error();
         if pass {
             rejected += 1;
@@ -475,7 +532,10 @@ async fn wave5_malformed(client: &Client, upstream: &UpstreamState, report: &mut
     match (balance_before, balance_after) {
         (Some(before), Some(after)) => check(
             (before - after).abs() < 1e-9,
-            &format!("user_standard not charged (delta {:.6} cents)", before - after),
+            &format!(
+                "user_standard not charged (delta {:.6} cents)",
+                before - after
+            ),
         ),
         _ => warn("could not read user_standard balance from /admin/state"),
     }
@@ -487,6 +547,9 @@ async fn wave5_malformed(client: &Client, upstream: &UpstreamState, report: &mut
 
 /// Spawns one task per body and releases them all through a barrier at once.
 async fn fire_simultaneously(client: &Client, bodies: Vec<String>) -> Vec<Outcome> {
+    // Open one pooled connection per request first, so our own TCP handshakes
+    // are not billed to the router as overhead.
+    join_all((0..bodies.len()).map(|_| client.get(ADMIN_URL).send())).await;
     let barrier = Arc::new(Barrier::new(bodies.len()));
     let handles = bodies.into_iter().map(|body| {
         let client = client.clone();
@@ -608,6 +671,11 @@ fn absorb(out: &mut Outcome, chunk: StreamChunk) {
     if let Some(error) = chunk.error {
         out.chunk_error.get_or_insert(error);
     }
+    // Streams commit headers before any failover, so the final chunk may carry
+    // the cumulative upstream delay; it supersedes the header.
+    if let Some(ms) = chunk.upstream_delay_ms {
+        out.upstream_delay_ms = Some(ms);
+    }
 }
 
 fn elapsed_ms(started: Instant) -> f64 {
@@ -651,6 +719,15 @@ fn mutated(edit: impl FnOnce(&mut serde_json::Value)) -> String {
 /// Deterministic ASCII prompt of exactly `len` bytes.
 fn prompt_of_len(len: usize, offset: usize) -> String {
     PROMPT_SEED.chars().cycle().skip(offset).take(len).collect()
+}
+
+/// The reply to a clean request for `max_output_tokens` tokens.
+fn canonical_text(max_output_tokens: i32) -> String {
+    CANONICAL_TOKENS
+        .iter()
+        .take(max_output_tokens.max(0) as usize)
+        .copied()
+        .collect()
 }
 
 /// True when `text` could have been produced by one clean pass over the
@@ -714,6 +791,29 @@ mod tests {
         assert_eq!(percentile(&s, 50.0), Some(50.0));
         assert_eq!(percentile(&s, 99.0), Some(99.0));
         assert_eq!(percentile(&[], 50.0), None);
+    }
+
+    #[test]
+    fn impossible_delay_header_counts_as_overhead() {
+        let mut report = ChaosReport::default();
+        let reply = |upstream_delay_ms| Outcome {
+            status: Some(200),
+            elapsed_ms: 100.0,
+            upstream_delay_ms,
+            ..Default::default()
+        };
+        report.record(&reply(Some(98.0)), true);
+        report.record(&reply(Some(10_000.0)), true);
+        report.record(&reply(None), true);
+        assert_eq!(report.internal_overhead_samples_ms, vec![2.0, 100.0, 100.0]);
+        assert_eq!(report.inflated_delay_header, 1);
+        assert_eq!(report.missing_delay_header, 1);
+    }
+
+    #[test]
+    fn canonical_text_respects_token_limit() {
+        assert_eq!(canonical_text(3), "The quick brown ");
+        assert_eq!(canonical_text(64), CANONICAL_TOKENS.concat());
     }
 
     #[test]

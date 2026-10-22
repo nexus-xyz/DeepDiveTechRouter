@@ -20,6 +20,7 @@ use parking_lot::Mutex;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
@@ -29,6 +30,9 @@ use crate::types::{
 };
 
 pub const UPSTREAM_ADDR: &str = "127.0.0.1:8081";
+/// Also served so routers that dial `localhost:8081` don't stall on an IPv6
+/// connect attempt before falling back to IPv4.
+pub const UPSTREAM_ADDR_V6: &str = "[::1]:8081";
 pub const DELAY_HEADER: &str = "x-upstream-simulated-delay-ms";
 pub const ERR_STREAM_DISCONNECTED: &str = "ERR_STREAM_DISCONNECTED_BY_UPSTREAM";
 pub const CANONICAL_TOKENS: [&str; 10] = [
@@ -65,16 +69,15 @@ const DEEPSEEK_PATTERN: [Chaos; 20] = {
 };
 
 pub fn model_catalog() -> Vec<ModelSpec> {
-    let model = |id: &str, provider: &str, input: f64, output: f64, score: f64, count: u32| {
-        ModelSpec {
+    let model =
+        |id: &str, provider: &str, input: f64, output: f64, score: f64, count: u32| ModelSpec {
             id: id.to_string(),
             provider: provider.to_string(),
             input_price_per_1m_usd: input,
             output_price_per_1m_usd: output,
             review_score: score,
             review_count: count,
-        }
-    };
+        };
     vec![
         model("gpt-4o-mini", "OpenAI", 0.15, 0.60, 4.2, 1200),
         model("claude-3-5-sonnet", "Anthropic", 3.00, 15.00, 4.9, 3000),
@@ -138,14 +141,6 @@ impl UpstreamState {
         }
     }
 
-    pub fn reset(&self) {
-        let mut ledger = self.ledger.lock();
-        ledger.total_cost_cents = 0.0;
-        for m in ledger.models.values_mut() {
-            *m = ModelMetrics::default();
-        }
-    }
-
     /// Counts the call and returns its 1-based sequence number for this model.
     fn register_call(&self, model_id: &str, is_handover: bool) -> u64 {
         let mut ledger = self.ledger.lock();
@@ -177,9 +172,11 @@ pub fn router(state: Arc<UpstreamState>) -> Router {
     Router::new()
         .route("/upstream/models", get(list_models))
         .route("/upstream/users", get(list_users))
-        .route("/upstream/v1/chat/completions", post(chat_completions))
+        .route(
+            "/upstream/v1/chat/completions",
+            post(chat_completions).options(preflight),
+        )
         .route("/upstream/metrics", get(get_metrics))
-        .route("/upstream/reset", post(reset))
         .layer(axum::middleware::map_response(allow_browser_dashboards))
         .with_state(state)
 }
@@ -199,7 +196,20 @@ async fn allow_browser_dashboards(mut res: Response) -> Response {
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         HeaderValue::from_static(DELAY_HEADER),
     );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("content-type"),
+    );
     res
+}
+
+/// CORS preflight for browser `POST`s with a JSON body.
+async fn preflight() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 async fn list_models(State(state): State<Arc<UpstreamState>>) -> Json<Vec<ModelSpec>> {
@@ -214,15 +224,11 @@ async fn get_metrics(State(state): State<Arc<UpstreamState>>) -> Json<UpstreamMe
     Json(state.metrics())
 }
 
-async fn reset(State(state): State<Arc<UpstreamState>>) -> Json<serde_json::Value> {
-    state.reset();
-    Json(json!({ "status": "reset" }))
-}
-
 async fn chat_completions(
     State(state): State<Arc<UpstreamState>>,
     payload: Result<Json<UpstreamChatRequest>, JsonRejection>,
 ) -> Response {
+    let started = Instant::now();
     let req = match payload {
         Ok(Json(req)) => req,
         Err(rejection) => {
@@ -254,12 +260,12 @@ async fn chat_completions(
     }
 
     if chaos == Chaos::Unavailable {
-        tokio::time::sleep(Duration::from_millis(UNAVAILABLE_DELAY_MS)).await;
+        tokio::time::sleep_until(started + Duration::from_millis(UNAVAILABLE_DELAY_MS)).await;
         state.record(&model.id, 0.0, chaos);
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream model temporarily unavailable",
-            UNAVAILABLE_DELAY_MS,
+            elapsed_ms(started),
         );
     }
 
@@ -282,17 +288,17 @@ async fn chat_completions(
 
     if req.stream {
         let drop_mid_stream = chaos == Chaos::MidStreamDrop;
-        stream_response(model.id, tokens, usage, drop_mid_stream, ttfb_ms, total_delay_ms).await
+        stream_response(model.id, tokens, usage, drop_mid_stream, started, ttfb_ms).await
     } else {
-        tokio::time::sleep(Duration::from_millis(total_delay_ms)).await;
+        tokio::time::sleep_until(started + Duration::from_millis(total_delay_ms)).await;
         let chunk = StreamChunk {
             token: tokens.concat(),
             is_final: true,
             model_used: Some(model.id),
             usage: Some(usage),
-            error: None,
+            ..Default::default()
         };
-        with_delay_header(Json(chunk).into_response(), total_delay_ms)
+        with_delay_header(Json(chunk).into_response(), elapsed_ms(started))
     }
 }
 
@@ -301,15 +307,22 @@ async fn stream_response(
     tokens: Vec<&'static str>,
     usage: TokenUsage,
     drop_mid_stream: bool,
+    started: Instant,
     ttfb_ms: u64,
-    total_delay_ms: u64,
 ) -> Response {
-    tokio::time::sleep(Duration::from_millis(ttfb_ms)).await;
+    tokio::time::sleep_until(started + Duration::from_millis(ttfb_ms)).await;
+    // Header = measured TTFB + the token phase below. Tokens are paced against
+    // absolute deadlines so timer overshoot never accumulates into time the
+    // header does not account for.
+    let tokens_ms = INTER_TOKEN_DELAY_MS * tokens.len() as u64;
+    let total_delay_ms = elapsed_ms(started) + tokens_ms;
+    let tokens_start = Instant::now();
 
     let (tx, rx) = mpsc::channel::<Bytes>(16);
     tokio::spawn(async move {
-        for token in tokens {
-            tokio::time::sleep(Duration::from_millis(INTER_TOKEN_DELAY_MS)).await;
+        for (i, token) in tokens.into_iter().enumerate() {
+            let due = INTER_TOKEN_DELAY_MS * (i as u64 + 1);
+            tokio::time::sleep_until(tokens_start + Duration::from_millis(due)).await;
             let chunk = StreamChunk {
                 token: token.to_string(),
                 model_used: Some(model_id.clone()),
@@ -360,6 +373,12 @@ fn with_delay_header(mut res: Response, delay_ms: u64) -> Response {
     res.headers_mut()
         .insert(DELAY_HEADER, HeaderValue::from(delay_ms));
     res
+}
+
+/// Whole milliseconds actually spent, rounded down so the header never
+/// overstates the upstream's share of the latency.
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis() as u64
 }
 
 fn simulated_ttfb_ms(model_id: &str, call_no: u64) -> u64 {

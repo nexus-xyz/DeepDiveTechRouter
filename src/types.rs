@@ -62,6 +62,10 @@ pub struct StreamChunk {
     pub usage: Option<TokenUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Router-only, final chunk of a stream: total simulated delay across every
+    /// upstream call (including mid-stream handovers). Overrides the header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_delay_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
