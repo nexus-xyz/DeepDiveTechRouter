@@ -11,16 +11,16 @@ use colored::{ColoredString, Colorize};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use crate::chaos::{percentile, ChaosReport, ADMIN_URL};
+use crate::chaos::{percentile, ChaosReport, ADMIN_URL, NEGATIVE_EPSILON_CENTS};
 use crate::types::{AdminStateResponse, UpstreamMetrics};
-use crate::upstream::{UpstreamState, UPSTREAM_ADDR};
+use crate::upstream::{initial_users, UpstreamState, UPSTREAM_ADDR, UPSTREAM_ADDR_V6};
 
 const COLD_START_MODEL: &str = "nexus-experimental-v1";
 const ROUTER_WAIT_SECS: u32 = 60;
-const NEGATIVE_EPSILON_CENTS: f64 = -0.0001;
 
 #[tokio::main]
 async fn main() {
+    request_precise_timers();
     let state = Arc::new(UpstreamState::new());
     let listener = match TcpListener::bind(UPSTREAM_ADDR).await {
         Ok(listener) => listener,
@@ -38,6 +38,14 @@ async fn main() {
             eprintln!("{} mock upstream stopped: {e}", "ERROR:".red().bold());
         }
     });
+
+    // Best effort: hosts without IPv6 loopback just skip it.
+    if let Ok(listener) = TcpListener::bind(UPSTREAM_ADDR_V6).await {
+        let server_state = state.clone();
+        tokio::spawn(async move {
+            let _ = upstream::serve(listener, server_state).await;
+        });
+    }
 
     print_banner();
 
@@ -64,10 +72,32 @@ async fn main() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Windows rounds timer waits up to its ~15.6ms tick by default, which would
+/// stretch every simulated upstream delay. Ask for 1ms resolution instead.
+#[cfg(windows)]
+fn request_precise_timers() {
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(period_ms: u32) -> u32;
+    }
+    // SAFETY: plain Win32 call with no pointers; the setting ends with the process.
+    unsafe {
+        timeBeginPeriod(1);
+    }
+}
+
+#[cfg(not(windows))]
+fn request_precise_timers() {}
+
 fn print_banner() {
     let line = "═".repeat(78);
     println!("{}", line.bright_magenta());
-    println!("{}", "  NEXUS HARNESS · AI Router Technical Interview".bright_magenta().bold());
+    println!(
+        "{}",
+        "  NEXUS HARNESS · AI Router Technical Interview"
+            .bright_magenta()
+            .bold()
+    );
     println!("{}", line.bright_magenta());
     println!(
         "  {} Mock upstream LLM server live on {}",
@@ -78,7 +108,6 @@ fn print_banner() {
     println!("      GET  /upstream/users                initial balances (cents)");
     println!("      POST /upstream/v1/chat/completions  JSON or SSE (stream: true)");
     println!("      GET  /upstream/metrics              upstream cost & per-model counters");
-    println!("      POST /upstream/reset                reset upstream counters");
     println!();
     println!("  Your router must serve:");
     println!("      POST http://127.0.0.1:8080/v1/chat/completions");
@@ -113,7 +142,10 @@ async fn wait_for_router(client: &reqwest::Client) {
             .await
             .is_ok_and(|r| r.status().is_success());
         if healthy {
-            println!("  {} router is healthy (after {attempt}s)", "✔".green().bold());
+            println!(
+                "  {} router is healthy (after {attempt}s)",
+                "✔".green().bold()
+            );
             return;
         }
         tokio::select! {
@@ -178,7 +210,8 @@ fn gate(pass: bool) -> Grade {
 }
 
 fn fmt_ms(v: Option<f64>) -> String {
-    v.map(|v| format!("{v:.3} ms")).unwrap_or_else(|| "N/A".to_string())
+    v.map(|v| format!("{v:.3} ms"))
+        .unwrap_or_else(|| "N/A".to_string())
 }
 
 fn row(metric: &str, measured: &str, junior: &str, principal: &str, grade: &Grade) {
@@ -247,7 +280,10 @@ fn print_scorecard(
         "< 350ms",
         &grade(ttfb_p95, None, 350.0, 600.0),
     );
-    detail(&format!("{} successful responses sampled", report.ttfb_samples_ms.len()));
+    detail(&format!(
+        "{} successful responses sampled",
+        report.ttfb_samples_ms.len()
+    ));
 
     // 4: negative balances (hard gate)
     match admin {
@@ -262,8 +298,20 @@ fn print_scorecard(
                 &format!("{negative} accounts"),
                 "0",
                 "0 (hard gate)",
-                &gate(negative == 0),
+                &gate(negative == 0 && report.wave2_overspend_cents == 0.0),
             );
+            if report.wave2_overspend_cents > 0.0 {
+                println!(
+                    "  {:<40} {}",
+                    "",
+                    format!(
+                        "wave 2: upstream spend exceeded user_low_balance by {:.6} cents",
+                        report.wave2_overspend_cents
+                    )
+                    .red()
+                    .bold()
+                );
+            }
             let mut balances: Vec<_> = state.user_balances_cents.iter().collect();
             balances.sort_by(|a, b| a.0.cmp(b.0));
             for (user, cents) in balances {
@@ -303,23 +351,53 @@ fn print_scorecard(
         report.wave4_streams
     ));
 
-    // 6: unbilled upstream bleed
-    let billed_cents = admin
-        .as_ref()
-        .map(|s| s.total_billed_to_users_cents)
-        .unwrap_or(0.0);
-    let bleed_usd = (metrics.total_upstream_cost_cents - billed_cents).max(0.0) / 100.0;
+    // 6: valid requests that failed (hard gate)
     row(
-        "6. Unbilled Upstream Bleed (Nexus Loss)",
-        &format!("${bleed_usd:.4}"),
-        "< $0.50",
-        "< $0.15",
-        &grade(Some(bleed_usd), None, 0.15, 0.50),
+        "6. Failed / Incomplete Valid Requests",
+        &format!("{} requests", report.incomplete_requests),
+        "0",
+        "0 (hard gate)",
+        &gate(report.incomplete_requests == 0),
+    );
+    detail("waves 1 & 4: every request must return 2xx with the full expected text");
+
+    // 7: unbilled upstream bleed, as a share of upstream cost. Billing is read
+    // from the balance deltas, not from the router's self-reported total.
+    let billed_cents = admin.as_ref().map_or(0.0, |s| {
+        initial_users()
+            .iter()
+            .filter_map(|u| {
+                s.user_balances_cents
+                    .get(&u.user_id)
+                    .map(|now| u.balance_cents - now)
+            })
+            .sum()
+    });
+    let bleed_cents = (metrics.total_upstream_cost_cents - billed_cents).max(0.0);
+    let bleed_pct = if metrics.total_upstream_cost_cents > 0.0 {
+        bleed_cents * 100.0 / metrics.total_upstream_cost_cents
+    } else {
+        0.0
+    };
+    row(
+        "7. Unbilled Upstream Bleed (Nexus Loss)",
+        &format!("{bleed_pct:.2} %"),
+        "< 5%",
+        "< 1%",
+        &grade(Some(bleed_pct), None, 1.0, 5.0),
     );
     detail(&format!(
-        "upstream cost {:.6} cents | billed to users {:.6} cents",
-        metrics.total_upstream_cost_cents, billed_cents
+        "upstream cost {:.6} cents | billed to users {:.6} cents (balance deltas) | unbilled {:.6} cents",
+        metrics.total_upstream_cost_cents, billed_cents, bleed_cents
     ));
+    if let Ok(state) = admin {
+        if (state.total_billed_to_users_cents - billed_cents).abs() > 1e-6 {
+            detail(&format!(
+                "router-reported total_billed_to_users_cents {:.6} does not match balance deltas",
+                state.total_billed_to_users_cents
+            ));
+        }
+    }
 
     println!("  {}", "─".repeat(96).dimmed());
 
@@ -338,8 +416,11 @@ fn print_scorecard(
         "  {:<40} {:>14}   {}",
         "Cold Start Traffic Share",
         format!("{cold_share:.2} %"),
-        format!("{cold_requests}/{} upstream calls to {COLD_START_MODEL}", metrics.total_requests)
-            .dimmed()
+        format!(
+            "{cold_requests}/{} upstream calls to {COLD_START_MODEL}",
+            metrics.total_requests
+        )
+        .dimmed()
     );
 
     println!("  {}", "Upstream calls per model:".dimmed());
@@ -367,6 +448,13 @@ fn print_scorecard(
             report.missing_delay_header
         );
     }
+    if report.inflated_delay_header > 0 {
+        println!(
+            "  {} {} successful responses claimed more upstream delay than the request took; full latency counted as overhead",
+            "!".yellow().bold(),
+            report.inflated_delay_header
+        );
+    }
     if report.transport_errors > 0 {
         println!(
             "  {} {}/{} requests got no HTTP response from :8080",
@@ -381,7 +469,10 @@ fn print_scorecard(
             .values()
             .all(|b| *b >= NEGATIVE_EPSILON_CENTS)
     });
-    let gates_ok = negatives_ok && report.corrupted_streams_count == 0;
+    let gates_ok = negatives_ok
+        && report.wave2_overspend_cents == 0.0
+        && report.corrupted_streams_count == 0
+        && report.incomplete_requests == 0;
     println!("{}", line.bright_magenta());
     println!(
         "  HARD GATES: {}",
