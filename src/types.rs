@@ -1,6 +1,3 @@
-//! Wire types shared by the mock upstream (:8081), the candidate router (:8080)
-//! and the chaos auditor.
-
 use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
@@ -31,13 +28,10 @@ pub struct UpstreamChatRequest {
     pub max_output_tokens: i32,
     #[serde(default)]
     pub stream: bool,
-    /// Text already delivered to the end client. The upstream resumes after it,
-    /// which enables seamless mid-stream failover without duplicated tokens.
     #[serde(default)]
     pub assistant_prefix: Option<String>,
 }
 
-/// Body the chaos engine sends to `POST :8080/v1/chat/completions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterChatRequest {
     pub request_id: String,

@@ -1,5 +1,3 @@
-//! nexus-harness: mock upstream (:8081) + 5-wave chaos auditor (-> :8080).
-
 mod chaos;
 mod types;
 mod upstream;
@@ -162,10 +160,6 @@ async fn wait_for_router(client: &reqwest::Client) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scorecard
-// ---------------------------------------------------------------------------
-
 enum Grade {
     PrincipalPlus,
     Principal,
@@ -249,7 +243,6 @@ fn print_scorecard(
     );
     println!("  {}", "─".repeat(96).dimmed());
 
-    // 1 & 2: internal router overhead
     let p50 = percentile(&report.internal_overhead_samples_ms, 50.0);
     let p99 = percentile(&report.internal_overhead_samples_ms, 99.0);
     row(
@@ -271,7 +264,6 @@ fn print_scorecard(
         report.internal_overhead_samples_ms.len()
     ));
 
-    // 3: end-to-end TTFB
     let ttfb_p95 = percentile(&report.ttfb_samples_ms, 95.0);
     row(
         "3. End-to-End TTFB (p95)",
@@ -285,7 +277,6 @@ fn print_scorecard(
         report.ttfb_samples_ms.len()
     ));
 
-    // 4: negative balances (hard gate)
     match admin {
         Ok(state) => {
             let negative = state
@@ -335,7 +326,6 @@ fn print_scorecard(
         }
     }
 
-    // 5: corrupted streams (hard gate)
     row(
         "5. Corrupted / Duplicated Streams",
         &format!("{} streams", report.corrupted_streams_count),
@@ -351,7 +341,6 @@ fn print_scorecard(
         report.wave4_streams
     ));
 
-    // 6: valid requests that failed (hard gate)
     row(
         "6. Failed / Incomplete Valid Requests",
         &format!("{} requests", report.incomplete_requests),
@@ -361,8 +350,6 @@ fn print_scorecard(
     );
     detail("waves 1 & 4: every request must return 2xx with the full expected text");
 
-    // 7: unbilled upstream bleed, as a share of upstream cost. Billing is read
-    // from the balance deltas, not from the router's self-reported total.
     let billed_cents = admin.as_ref().map_or(0.0, |s| {
         initial_users()
             .iter()
@@ -401,7 +388,6 @@ fn print_scorecard(
 
     println!("  {}", "─".repeat(96).dimmed());
 
-    // Cold start exploration
     let cold_requests = metrics
         .models
         .get(COLD_START_MODEL)
