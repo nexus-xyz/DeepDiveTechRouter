@@ -1,6 +1,3 @@
-//! 5-wave chaos traffic generator and auditor, fired at the candidate router
-//! on 127.0.0.1:8080.
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -22,7 +19,6 @@ pub const ADMIN_URL: &str = "http://127.0.0.1:8080/admin/state";
 const PROMPT_SEED: &str =
     "Nexus routes every prompt across five upstream providers while keeping a strict ledger. ";
 pub const NEGATIVE_EPSILON_CENTS: f64 = -0.0001;
-/// Slack for comparing the router's propagated delay with our own clock.
 const DELAY_HEADER_TOLERANCE_MS: f64 = 1.0;
 
 /// Everything observed about a single request to the router.
@@ -63,16 +59,11 @@ pub struct ChaosReport {
     pub internal_overhead_samples_ms: Vec<f64>,
     pub ttfb_samples_ms: Vec<f64>,
     pub corrupted_streams_count: usize,
-    /// Valid, affordable requests (waves 1 & 4) that did not return 2xx with
-    /// the full expected text.
     pub incomplete_requests: usize,
-    /// Upstream spend on `user_low_balance` beyond its balance in wave 2.
     pub wave2_overspend_cents: f64,
     pub total_requests: usize,
     pub transport_errors: usize,
-    /// 2xx responses that did not propagate `X-Upstream-Simulated-Delay-Ms`.
     pub missing_delay_header: usize,
-    /// 2xx responses claiming more upstream delay than the request took.
     pub inflated_delay_header: usize,
     pub wave4_streams: usize,
     pub wave4_complete: usize,
@@ -81,8 +72,6 @@ pub struct ChaosReport {
 }
 
 impl ChaosReport {
-    /// Latency is sampled only for 2xx replies; `sample_latency: false` skips
-    /// replies that may be served from an idempotency cache.
     fn record(&mut self, o: &Outcome, sample_latency: bool) {
         self.total_requests += 1;
         if o.transport_error.is_some() {
@@ -92,7 +81,6 @@ impl ChaosReport {
         if !o.is_success() || !sample_latency {
             return;
         }
-        // A missing or impossible header counts the full latency as overhead.
         let upstream_ms = match o.upstream_delay_ms {
             None => {
                 self.missing_delay_header += 1;
@@ -152,11 +140,6 @@ async fn balance_of(client: &Client, user_id: &str) -> Option<f64> {
         .and_then(|s| s.user_balances_cents.get(user_id).copied())
 }
 
-// ---------------------------------------------------------------------------
-// Waves
-// ---------------------------------------------------------------------------
-
-/// Returns the router's billed / upstream-cost ratio, used to judge wave 3.
 async fn wave1_financial_precision(
     client: &Client,
     upstream: &UpstreamState,
@@ -355,7 +338,6 @@ async fn wave3_idempotency_storm(
             info(&format!(
                 "user_standard debited {debited:.6} cents | upstream cost incurred {cost:.6} cents"
             ));
-            // Allowance: one generation at the markup observed in wave 1, x2.
             let one_generation = cost / generations.max(1) as f64;
             let allowance = 2.0 * markup.unwrap_or(1.0).max(1.0) * one_generation;
             check(
@@ -730,8 +712,6 @@ fn canonical_text(max_output_tokens: i32) -> String {
         .collect()
 }
 
-/// True when `text` could have been produced by one clean pass over the
-/// canonical sentence (no restarts, no duplicated prefixes, no garbage).
 fn is_canonical_prefix(text: &str) -> bool {
     CANONICAL_TOKENS.concat().starts_with(text)
 }

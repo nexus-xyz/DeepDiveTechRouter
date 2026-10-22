@@ -60,9 +60,6 @@ enum Chaos {
     Normal,
 }
 
-/// deepseek-v3 behaviour by call number (mod 20): 7x 503 (35%), 7x mid-stream
-/// drop (35%, streaming only), 6x normal (30%). Deterministic so every
-/// candidate faces the same storm.
 const DEEPSEEK_PATTERN: [Chaos; 20] = {
     use Chaos::{MidStreamDrop as D, Normal as N, Unavailable as U};
     [U, D, N, U, D, U, N, D, U, D, N, U, D, N, U, D, N, U, D, N]
@@ -282,7 +279,6 @@ async fn chat_completions(
         input_tokens,
         output_tokens: tokens.len() as u32,
     };
-    // Upstream bills for everything it generated, even if the stream later dies.
     state.record(&model.id, cost_cents(&model, usage), chaos);
     let total_delay_ms = ttfb_ms + INTER_TOKEN_DELAY_MS * tokens.len() as u64;
 
