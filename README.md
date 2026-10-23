@@ -55,7 +55,7 @@ Upstream cost in cents: `(input_tokens * input_price + output_tokens * output_pr
 ```
 
 - `stream: false` returns one JSON `StreamChunk`: `{"token":"<full text>","is_final":true,"model_used":"...","usage":{...}}`
-- `stream: true` returns `text/event-stream` frames `data: <StreamChunk JSON>\n\n`
+- `stream: true` returns `text/event-stream` frames `data: <StreamChunk JSON>\n\n`. If a stream cannot be completed, end it with a final chunk carrying an `"error"` field.
 - Only models with `review_score >= min_review_score` may serve the request.
 - Return the total upstream time spent on the request in `X-Upstream-Simulated-Delay-Ms`, summed over every upstream call you made for it. For streams, the final chunk may also carry `"upstream_delay_ms": <total>`, which replaces the header value.
 - Use `402` for insufficient balance and `4xx` for invalid or unroutable requests.
