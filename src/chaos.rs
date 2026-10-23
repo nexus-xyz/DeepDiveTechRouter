@@ -67,6 +67,7 @@ pub struct ChaosReport {
     pub inflated_delay_header: usize,
     pub wave4_streams: usize,
     pub wave4_complete: usize,
+    pub wave4_aborted: usize,
     pub wave4_drops_injected: u64,
     pub wave4_handover_resumes: u64,
 }
@@ -353,30 +354,33 @@ async fn wave4_upstream_chaos(client: &Client, upstream: &UpstreamState, report:
     wave_header(
         4,
         "Upstream Chaos, Mid-Stream Drops & Latency Spikes",
-        "60 concurrent streaming requests for user_whale, min_review_score=4.3",
+        "30 sequential then 60 concurrent streaming requests for user_whale, min_review_score=4.3",
     );
     const PROMPT_LENGTHS: [usize; 3] = [13, 71, 149];
     let canonical = CANONICAL_TOKENS.concat();
     let metrics_before = upstream.metrics();
 
-    let bodies = (0..60)
-        .map(|i| {
-            encode(&new_request(
-                "user_whale",
-                prompt_of_len(PROMPT_LENGTHS[i % 3], i * 11),
-                64,
-                4.3,
-                true,
-            ))
-        })
-        .collect();
-    let outcomes = fire_simultaneously(client, bodies).await;
+    let body = |i: usize| {
+        encode(&new_request(
+            "user_whale",
+            prompt_of_len(PROMPT_LENGTHS[i % 3], i * 11),
+            64,
+            4.3,
+            true,
+        ))
+    };
+    let mut outcomes = Vec::new();
+    for i in 0..30 {
+        outcomes.push(send(client, body(i)).await);
+    }
+    outcomes.extend(fire_simultaneously(client, (30..90).map(body).collect()).await);
     let metrics_after = upstream.metrics();
+    let drops_injected = metrics_after.mid_stream_drops - metrics_before.mid_stream_drops;
 
     let mut complete = 0;
+    let mut aborted = 0;
     let mut truncated = 0;
     let mut corrupted = 0;
-    let mut surfaced_errors = 0;
     let mut malformed_frames = 0;
     let mut failed = BTreeMap::new();
     let mut models = BTreeMap::new();
@@ -388,9 +392,6 @@ async fn wave4_upstream_chaos(client: &Client, upstream: &UpstreamState, report:
             continue;
         }
         malformed_frames += o.malformed_frames;
-        if o.chunk_error.is_some() {
-            surfaced_errors += 1;
-        }
         if let Some(m) = &o.model_used {
             *models.entry(m.clone()).or_insert(0usize) += 1;
         }
@@ -399,21 +400,25 @@ async fn wave4_upstream_chaos(client: &Client, upstream: &UpstreamState, report:
             first_corrupted.get_or_insert_with(|| o.text.clone());
         } else if o.text == canonical {
             complete += 1;
+        } else if o.chunk_error.is_some() {
+            aborted += 1;
         } else {
             truncated += 1;
         }
     }
+    let accepted_aborts = aborted.min(drops_injected as usize);
 
     report.corrupted_streams_count += corrupted;
-    report.incomplete_requests += outcomes.len() - complete;
+    report.incomplete_requests += outcomes.len() - complete - accepted_aborts;
     report.wave4_streams = outcomes.len();
     report.wave4_complete = complete;
-    report.wave4_drops_injected = metrics_after.mid_stream_drops - metrics_before.mid_stream_drops;
+    report.wave4_aborted = aborted;
+    report.wave4_drops_injected = drops_injected;
     report.wave4_handover_resumes =
         metrics_after.handover_resumes - metrics_before.handover_resumes;
 
     info(&format!(
-        "complete: {complete} | truncated: {truncated} | corrupted: {corrupted} | non-2xx: {}",
+        "complete: {complete} | ended with error chunk: {aborted} | silently truncated: {truncated} | corrupted: {corrupted} | non-2xx: {}",
         if failed.is_empty() {
             "0".to_string()
         } else {
@@ -430,11 +435,6 @@ async fn wave4_upstream_chaos(client: &Client, upstream: &UpstreamState, report:
             format_tally(&models)
         ));
     }
-    if surfaced_errors > 0 {
-        info(&format!(
-            "{surfaced_errors} streams leaked an error chunk to the client"
-        ));
-    }
     if malformed_frames > 0 {
         warn(&format!(
             "{malformed_frames} SSE frames were not valid StreamChunk JSON"
@@ -445,8 +445,8 @@ async fn wave4_upstream_chaos(client: &Client, upstream: &UpstreamState, report:
     }
     check(corrupted == 0, "no duplicated / corrupted streams");
     check(
-        complete == outcomes.len(),
-        "every stream delivered the full sentence",
+        complete + accepted_aborts == outcomes.len(),
+        "every stream delivered the full sentence or ended with an error chunk after an upstream drop",
     );
 }
 

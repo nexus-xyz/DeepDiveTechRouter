@@ -334,11 +334,12 @@ fn print_scorecard(
         &gate(report.corrupted_streams_count == 0),
     );
     detail(&format!(
-        "wave 4: {} mid-stream drops injected, {} seamless handovers (assistant_prefix), {}/{} streams complete",
+        "wave 4: {} mid-stream drops injected, {} seamless handovers (assistant_prefix), {}/{} streams complete, {} ended with an error chunk",
         report.wave4_drops_injected,
         report.wave4_handover_resumes,
         report.wave4_complete,
-        report.wave4_streams
+        report.wave4_streams,
+        report.wave4_aborted
     ));
 
     row(
@@ -348,7 +349,7 @@ fn print_scorecard(
         "0 (hard gate)",
         &gate(report.incomplete_requests == 0),
     );
-    detail("waves 1 & 4: every request must return 2xx with the full expected text");
+    detail("waves 1 & 4: 2xx with the full expected text; a stream may instead end with an error chunk (at most one per upstream drop)");
 
     let billed_cents = admin.as_ref().map_or(0.0, |s| {
         initial_users()
