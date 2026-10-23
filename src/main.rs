@@ -269,8 +269,8 @@ fn print_scorecard(
         "3. End-to-End TTFB (p95)",
         &fmt_ms(ttfb_p95),
         "< 600ms",
-        "< 350ms",
-        &grade(ttfb_p95, None, 350.0, 600.0),
+        "< 350ms (+ < 200)",
+        &grade(ttfb_p95, Some(200.0), 350.0, 600.0),
     );
     detail(&format!(
         "{} successful responses sampled",
@@ -371,8 +371,8 @@ fn print_scorecard(
         "7. Unbilled Upstream Bleed (Nexus Loss)",
         &format!("{bleed_pct:.2} %"),
         "< 5%",
-        "< 1%",
-        &grade(Some(bleed_pct), None, 1.0, 5.0),
+        "< 1% (+ 0.00%)",
+        &grade(Some(bleed_pct), Some(0.005), 1.0, 5.0),
     );
     detail(&format!(
         "upstream cost {:.6} cents | billed to users {:.6} cents (balance deltas) | unbilled {:.6} cents",
